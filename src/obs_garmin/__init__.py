@@ -1,10 +1,18 @@
 import asyncio
 import logging
 import os
+import signal
 import sys
+from concurrent.futures import Future, ProcessPoolExecutor
+from contextlib import suppress
 from dataclasses import dataclass
+from functools import partial
+from multiprocessing import Manager
+from queue import Empty, Queue
 from struct import unpack
-from typing import TextIO
+from threading import Event
+from types import FrameType
+from typing import Any, Callable, TextIO
 
 import typer
 from bleak import BleakClient, BleakScanner
@@ -25,17 +33,37 @@ type OBS_CONFIG = tuple[str, str, str, str]
 
 
 @dataclass
-class DisconnectHandler:
-    event: asyncio.Event
+class ShutdownHandler:
+    exit_event: Event
 
-    def __call__(self, client: BleakClient) -> None:
-        self.event.set()
+    def __call__(
+        self, signum: int | None = None, frame: FrameType | None = None
+    ) -> None:
+        logger.info("MAIN: Sending exit event to all tasks in pool")
+        self.exit_event.set()
+
+
+@dataclass
+class DoneHandler:
+    name: str
+    shutdown_handler: ShutdownHandler
+
+    def __call__(self, future: Future) -> None:
+        logger.info(
+            "MAIN: Task is done, prompting others to quit. name=%s, future=%s",
+            self.name,
+            future,
+        )
+
+        if future.exception() is not None:
+            logger.exception(future.exception())  # type: ignore
+
+        self.shutdown_handler(None, None)
 
 
 @dataclass
 class HeartbeatHandler:
-    obs: ReqClient
-    event: asyncio.Event
+    queue: Queue
 
     def __call__(self, sender, data) -> None:
         """Callback to handle heart rate measurement data."""
@@ -56,16 +84,29 @@ class HeartbeatHandler:
 
         # You can add logic here for other fields like Sensor Contact, Energy Expended, etc.
         logger.info(f"[{flags:04b}] Heart Rate: {hr_value} BPM")
+        asyncio.create_task(asyncio.to_thread(self.queue.put, hr_value))
 
-        try:
-            self.obs.set_input_settings(
-                os.environ["OBS_SOURCE"],
-                {"text": f"{hr_value:3d}"},
-                True,
-            )
-        except Exception as e:
-            logger.error(f"An unexpected error occurred during OBS update: {e}")
-            self.event.set()
+
+@dataclass
+class Submission:
+    name: str
+    callable: Callable[..., Any]
+    queue: Queue
+    exit_event: Event
+    shutdown_handler: ShutdownHandler
+    is_async: bool = True
+
+    def submit(self, executor: ProcessPoolExecutor) -> Future:
+        future = executor.submit(self)
+        future.add_done_callback(DoneHandler(self.name, self.shutdown_handler))
+
+        return future
+
+    def __call__(self) -> None:
+        if self.is_async:
+            asyncio.run(self.callable(exit_event=self.exit_event, queue=self.queue))
+        else:
+            self.callable(exit_event=self.exit_event, queue=self.queue)
 
 
 @app.command("setup")
@@ -86,47 +127,28 @@ def setup() -> None:
 
 @app.command("run")
 def run() -> None:
-    async def _run(obs: ReqClient):
-        logger.info(f"Attempting to connect to {os.environ['DEVICE_ADDRESS']} ...")
-
-        exit_event = asyncio.Event()
-        try:
-            async with BleakClient(
-                os.environ["DEVICE_ADDRESS"],
-                timeout=15.0,
-                pair=True,
-                disconnected_callback=DisconnectHandler(exit_event),
-            ) as client:
-                logging.info("Connected! Subscribing to HR characteristic...")
-
-                # This is the key step to start receiving data
-                await client.start_notify(
-                    HR_MEASUREMENT_CHARACTERISTIC_UUID,
-                    HeartbeatHandler(obs, exit_event),
-                )
-
-                # Keep the connection alive to receive notifications
-                logger.info("Waiting for heart rate data...")
-                await exit_event.wait()
-
-        except Exception as e:
-            logger.error(f"An error occurred: {e}")
-            logger.exception(e)
-
-        finally:
-            logger.info("Client disconnected.")
-
     load_dotenv()
 
-    asyncio.run(
-        _run(
-            ReqClient(
-                host=os.environ["OBS_HOST"],
-                port=int(os.environ["OBS_PORT"]),
-                password=os.environ["OBS_PASSWORD"],
+    manager = Manager()
+    queue = manager.Queue()
+    event = manager.Event()
+
+    shutdown_handler = ShutdownHandler(event)
+
+    for s in (signal.SIGHUP, signal.SIGTERM, signal.SIGINT):
+        signal.signal(s, shutdown_handler)
+
+    with ProcessPoolExecutor(max_workers=5) as executor:
+        try:
+            Submission(
+                "consumer", consumer, queue, event, shutdown_handler, False
+            ).submit(executor)
+            Submission("producer", producer, queue, event, shutdown_handler).submit(
+                executor
             )
-        )
-    )
+        except Exception as e:
+            logger.exception(e)
+            event.set()
 
 
 @app.command("discover")
@@ -201,3 +223,62 @@ async def setup_obs() -> OBS_CONFIG:
         await asyncio.to_thread(Prompt.ask, "OBS websocket password", password=True),
         await asyncio.to_thread(Prompt.ask, "OBS websocket source"),
     )
+
+
+async def producer(queue: Queue, exit_event: Event) -> None:
+    logger.info(f"Attempting to connect to {os.environ['DEVICE_ADDRESS']} ...")
+
+    try:
+        async with BleakClient(
+            os.environ["DEVICE_ADDRESS"],
+            timeout=15.0,
+            pair=True,
+            disconnected_callback=ShutdownHandler(exit_event),  # type: ignore
+        ) as client:
+            logging.info("Connected! Subscribing to HR characteristic...")
+
+            # This is the key step to start receiving data
+            await client.start_notify(
+                HR_MEASUREMENT_CHARACTERISTIC_UUID,
+                HeartbeatHandler(queue),
+            )
+
+            # Keep the connection alive to receive notifications
+            logger.info("Waiting for heart rate data...")
+
+            await asyncio.to_thread(exit_event.wait)
+
+    except Exception as e:
+        logger.error(f"An error occurred: {e}")
+        logger.exception(e)
+
+        exit_event.set()
+
+    finally:
+        logger.info("Client disconnected.")
+
+
+def consumer(queue: Queue, exit_event: Event) -> None:
+    obs = ReqClient(
+        host=os.environ["OBS_HOST"],
+        port=int(os.environ["OBS_PORT"]),
+        password=os.environ["OBS_PASSWORD"],
+    )
+
+    try:
+        logger.info("Starting consumption loop")
+        while True:
+            if exit_event.is_set():
+                logger.info("Exiting consumption loop")
+                break
+
+            with suppress(Empty):
+                if item := queue.get(timeout=5.0):
+                    obs.set_input_settings(
+                        os.environ["OBS_SOURCE"],
+                        {"text": f"{item:3d}"},
+                        True,
+                    )
+    except Exception as e:
+        logger.exception(e)
+        exit_event.set()
