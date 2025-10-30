@@ -6,14 +6,14 @@ import sys
 from concurrent.futures import Future, ProcessPoolExecutor
 from contextlib import suppress
 from dataclasses import dataclass
-from functools import partial
 from multiprocessing import Manager
 from queue import Empty, Queue
 from struct import unpack
 from threading import Event
 from types import FrameType
-from typing import Any, Callable, TextIO
+from typing import Any, Callable
 
+import structlog
 import typer
 from bleak import BleakClient, BleakScanner
 from dotenv import load_dotenv
@@ -22,9 +22,7 @@ from rich import print
 from rich.prompt import IntPrompt, Prompt
 
 app = typer.Typer()
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-logging.basicConfig()
+logger = structlog.getLogger(__name__)
 
 
 HR_MEASUREMENT_CHARACTERISTIC_UUID = "00002a37-0000-1000-8000-00805f9b34fb"
@@ -50,13 +48,14 @@ class DoneHandler:
 
     def __call__(self, future: Future) -> None:
         logger.info(
-            "MAIN: Task is done, prompting others to quit. name=%s, future=%s",
-            self.name,
-            future,
+            "Task is done, prompting others to quit.",
+            name=self.name,
+            future=future,
         )
 
         if future.exception() is not None:
-            logger.exception(future.exception())  # type: ignore
+            logger.error(type(future.exception()))
+            logger.exception(future.exception())
 
         self.shutdown_handler(None, None)
 
@@ -111,18 +110,18 @@ class Submission:
 
 @app.command("setup")
 def setup() -> None:
-    async def _setup(file: TextIO) -> None:
+    async def _setup() -> None:
         device = await setup_device()
         obs_host, obs_port, obs_password, obs_source = await setup_obs()
 
-        file.write(f"DEVICE_ADDRESS={device}\n")
-        file.write(f"OBS_HOST={obs_host}\n")
-        file.write(f"OBS_PORT={obs_port}\n")
-        file.write(f"OBS_PASSWORD={obs_password}\n")
-        file.write(f"OBS_SOURCE={obs_source}")
+        with open(".env", "w") as file:
+            file.write(f"DEVICE_ADDRESS={device}\n")
+            file.write(f"OBS_HOST={obs_host}\n")
+            file.write(f"OBS_PORT={obs_port}\n")
+            file.write(f"OBS_PASSWORD={obs_password}\n")
+            file.write(f"OBS_SOURCE={obs_source}")
 
-    with open(".env", "w") as file:
-        asyncio.run(_setup(file))
+    asyncio.run(_setup())
 
 
 @app.command("run")
@@ -281,4 +280,5 @@ def consumer(queue: Queue, exit_event: Event) -> None:
                     )
     except Exception as e:
         logger.exception(e)
+
         exit_event.set()
